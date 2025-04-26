@@ -3,11 +3,12 @@ package oss
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
+	"github.com/google/uuid"
 
 	"github.com/sjzar/file-store-mcp/pkg/util"
 )
@@ -63,7 +64,7 @@ func NewOSSClient(cfg OSSConfig) (*OSSClient, error) {
 }
 
 // UploadFile uploads a local file to OSS and returns the download URL
-func (o *OSSClient) UploadFile(ctx context.Context, path string) (string, error) {
+func (o *OSSClient) UploadFile(ctx context.Context, path string, filename string) (string, error) {
 	// Open the file
 	file, err := os.Open(path)
 	if err != nil {
@@ -77,16 +78,15 @@ func (o *OSSClient) UploadFile(ctx context.Context, path string) (string, error)
 		return "", fmt.Errorf("failed to get file info: %w", err)
 	}
 
-	// Get the filename as the object key
-	fileName := filepath.Base(path)
-
-	// Generate a unique object key to avoid filename conflicts
-	// Using timestamp as prefix
-	objectKey := fmt.Sprintf("%d/%s", time.Now().Unix(), fileName)
+	// Format the object key using the provided format
+	objectKey := filename
+	if len(objectKey) == 0 {
+		objectKey = uuid.New().String()
+	}
 
 	// Set file metadata
 	options := []oss.Option{
-		oss.ContentType(util.GetContentType(fileName)),
+		oss.ContentType(util.GetContentType(filename)),
 		oss.ContentLength(fileInfo.Size()),
 	}
 
@@ -94,6 +94,54 @@ func (o *OSSClient) UploadFile(ctx context.Context, path string) (string, error)
 	err = o.bucket.PutObject(objectKey, file, options...)
 	if err != nil {
 		return "", fmt.Errorf("failed to upload file to OSS: %w", err)
+	}
+
+	// Build the file download URL
+	var downloadURL string
+	if o.domain != "" {
+		// If custom domain is provided and we want to use it directly without signing
+		// This is useful when the bucket is configured with CDN or public read access
+		if isPublicDomain(o.domain) {
+			downloadURL = fmt.Sprintf("%s/%s", o.domain, objectKey)
+		} else {
+			// Generate signed URL with custom domain
+			signedURL, err := o.bucket.SignURL(objectKey, oss.HTTPGet, int64(o.urlExpiration.Seconds()))
+			if err != nil {
+				return "", fmt.Errorf("failed to generate signed URL: %w", err)
+			}
+			// Replace the default endpoint with custom domain in the signed URL
+			defaultEndpoint := fmt.Sprintf("https://%s.%s", o.bucketName, o.endpoint)
+			downloadURL = replaceEndpoint(signedURL, defaultEndpoint, o.domain)
+		}
+	} else {
+		// Generate signed URL with default endpoint
+		signedURL, err := o.bucket.SignURL(objectKey, oss.HTTPGet, int64(o.urlExpiration.Seconds()))
+		if err != nil {
+			return "", fmt.Errorf("failed to generate signed URL: %w", err)
+		}
+		downloadURL = signedURL
+	}
+
+	return downloadURL, nil
+}
+
+// Upload uploads data from an io.Reader to OSS and returns the download URL
+func (o *OSSClient) Upload(ctx context.Context, body io.Reader, filename string) (string, error) {
+	// Format the object key using the provided format
+	objectKey := filename
+	if len(objectKey) == 0 {
+		objectKey = uuid.New().String()
+	}
+
+	// Set file metadata
+	options := []oss.Option{
+		oss.ContentType(util.GetContentType(filename)),
+	}
+
+	// Upload data to OSS
+	err := o.bucket.PutObject(objectKey, body, options...)
+	if err != nil {
+		return "", fmt.Errorf("failed to upload data to OSS: %w", err)
 	}
 
 	// Build the file download URL

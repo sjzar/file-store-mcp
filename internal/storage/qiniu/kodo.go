@@ -1,11 +1,13 @@
 package qiniu
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"path/filepath"
+	"io"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/qiniu/go-sdk/v7/auth/qbox"
 	"github.com/qiniu/go-sdk/v7/storage"
 
@@ -72,13 +74,12 @@ func NewQiniuClient(cfg QiniuConfig) (*QiniuClient, error) {
 }
 
 // UploadFile uploads a local file to Qiniu cloud and returns the download URL
-func (q *QiniuClient) UploadFile(ctx context.Context, path string) (string, error) {
-	// Get the filename as the object key
-	fileName := filepath.Base(path)
-
-	// Generate a unique object key to avoid filename conflicts
-	// Using timestamp as prefix
-	objectKey := fmt.Sprintf("%d/%s", time.Now().Unix(), fileName)
+func (q *QiniuClient) UploadFile(ctx context.Context, path string, filename string) (string, error) {
+	// Format the object key using the provided format
+	objectKey := filename
+	if len(objectKey) == 0 {
+		objectKey = uuid.New().String()
+	}
 
 	// Create authentication information
 	mac := qbox.NewMac(q.accessKey, q.secretKey)
@@ -121,15 +122,87 @@ func (q *QiniuClient) UploadFile(ctx context.Context, path string) (string, erro
 	// Create upload options
 	putExtra := storage.PutExtra{
 		Params: map[string]string{
-			"x:name": fileName,
+			"x:name": filename,
 		},
-		MimeType: util.GetContentType(fileName),
+		MimeType: util.GetContentType(filename),
 	}
 
 	// Upload file
 	err := formUploader.PutFile(ctx, &ret, upToken, objectKey, path, &putExtra)
 	if err != nil {
 		return "", fmt.Errorf("failed to upload file to Qiniu cloud: %w", err)
+	}
+
+	// Build file download URL with authentication
+	downloadURL := storage.MakePrivateURL(mac, q.domain, ret.Key, time.Now().Add(q.expiration).Unix())
+
+	return downloadURL, nil
+}
+
+// Upload uploads data from an io.Reader to Qiniu cloud and returns the download URL
+func (q *QiniuClient) Upload(ctx context.Context, body io.Reader, filename string) (string, error) {
+	// Format the object key using the provided format
+	objectKey := filename
+	if len(objectKey) == 0 {
+		objectKey = uuid.New().String()
+	}
+
+	// Create authentication information
+	mac := qbox.NewMac(q.accessKey, q.secretKey)
+
+	// Create storage configuration
+	cfg := storage.Config{}
+
+	// Set storage region
+	switch q.region {
+	case "z0":
+		cfg.Zone = &storage.ZoneHuadong
+	case "z1":
+		cfg.Zone = &storage.ZoneHuabei
+	case "z2":
+		cfg.Zone = &storage.ZoneHuanan
+	case "na0":
+		cfg.Zone = &storage.ZoneBeimei
+	case "as0":
+		cfg.Zone = &storage.ZoneXinjiapo
+	default:
+		// Default to East China region
+		cfg.Zone = &storage.ZoneHuadong
+	}
+
+	// Use HTTPS
+	cfg.UseHTTPS = true
+	// Use CDN acceleration
+	cfg.UseCdnDomains = true
+
+	// Create form uploader object
+	formUploader := storage.NewFormUploader(&cfg)
+	ret := storage.PutRet{}
+
+	// Create upload policy
+	putPolicy := storage.PutPolicy{
+		Scope: q.bucketName + ":" + objectKey,
+	}
+	upToken := putPolicy.UploadToken(mac)
+
+	// Create upload options
+	putExtra := storage.PutExtra{
+		Params: map[string]string{
+			"x:name": filename,
+		},
+		MimeType: util.GetContentType(filename),
+	}
+
+	// Read all data from the reader
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read data: %w", err)
+	}
+
+	// Upload data
+	err = formUploader.Put(ctx, &ret, upToken, objectKey, bytes.NewReader(data), int64(len(data)), &putExtra)
+	if err != nil {
+		return "", fmt.Errorf("failed to upload data to Qiniu cloud: %w", err)
 	}
 
 	// Build file download URL with authentication

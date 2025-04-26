@@ -3,12 +3,13 @@ package cos
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tencentyun/cos-go-sdk-v5"
 
 	"github.com/sjzar/file-store-mcp/pkg/util"
@@ -91,7 +92,7 @@ func NewCOSClient(cfg COSConfig) (*COSClient, error) {
 }
 
 // UploadFile uploads a local file to COS and returns the download URL
-func (c *COSClient) UploadFile(ctx context.Context, path string) (string, error) {
+func (c *COSClient) UploadFile(ctx context.Context, path string, filename string) (string, error) {
 	// Open the file
 	file, err := os.Open(path)
 	if err != nil {
@@ -99,17 +100,16 @@ func (c *COSClient) UploadFile(ctx context.Context, path string) (string, error)
 	}
 	defer file.Close()
 
-	// Get the filename as the object key
-	fileName := filepath.Base(path)
-
-	// Generate a unique object key to avoid filename conflicts
-	// Using timestamp as prefix
-	objectKey := fmt.Sprintf("%d/%s", time.Now().Unix(), fileName)
+	// Format the object key using the provided format
+	objectKey := filename
+	if len(objectKey) == 0 {
+		objectKey = uuid.New().String()
+	}
 
 	// Set upload options
 	opt := &cos.ObjectPutOptions{
 		ObjectPutHeaderOptions: &cos.ObjectPutHeaderOptions{
-			ContentType: util.GetContentType(fileName),
+			ContentType: util.GetContentType(filename),
 		},
 		ACLHeaderOptions: &cos.ACLHeaderOptions{
 			// Set object access permission to public read
@@ -121,6 +121,48 @@ func (c *COSClient) UploadFile(ctx context.Context, path string) (string, error)
 	_, err = c.client.Object.Put(ctx, objectKey, file, opt)
 	if err != nil {
 		return "", fmt.Errorf("failed to upload file to COS: %w", err)
+	}
+
+	// Build file download URL
+	var downloadURL string
+	if c.domain != "" {
+		// Use custom domain
+		downloadURL = fmt.Sprintf("%s/%s", c.domain, objectKey)
+	} else {
+		// Generate a presigned URL with expiration
+		presignedURL, err := c.client.Object.GetPresignedURL(ctx, http.MethodGet, objectKey, c.secretID, c.secretKey, c.expiration, nil)
+		if err != nil {
+			return "", fmt.Errorf("failed to generate presigned URL: %w", err)
+		}
+		downloadURL = presignedURL.String()
+	}
+
+	return downloadURL, nil
+}
+
+// Upload uploads data from an io.Reader to COS and returns the download URL
+func (c *COSClient) Upload(ctx context.Context, body io.Reader, filename string) (string, error) {
+	// Format the object key using the provided format
+	objectKey := filename
+	if len(objectKey) == 0 {
+		objectKey = uuid.New().String()
+	}
+
+	// Set upload options
+	opt := &cos.ObjectPutOptions{
+		ObjectPutHeaderOptions: &cos.ObjectPutHeaderOptions{
+			ContentType: util.GetContentType(filename),
+		},
+		ACLHeaderOptions: &cos.ACLHeaderOptions{
+			// Set object access permission to public read
+			XCosACL: "public-read",
+		},
+	}
+
+	// Upload data to COS
+	_, err := c.client.Object.Put(ctx, objectKey, body, opt)
+	if err != nil {
+		return "", fmt.Errorf("failed to upload data to COS: %w", err)
 	}
 
 	// Build file download URL

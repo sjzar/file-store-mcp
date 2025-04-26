@@ -3,14 +3,15 @@ package s3
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/google/uuid"
 
 	"github.com/sjzar/file-store-mcp/pkg/util"
 )
@@ -94,7 +95,7 @@ func NewS3Client(cfg S3Config) (*S3Client, error) {
 }
 
 // UploadFile uploads a local file to S3 and returns the download URL
-func (s *S3Client) UploadFile(ctx context.Context, path string) (string, error) {
+func (s *S3Client) UploadFile(ctx context.Context, path string, filename string) (string, error) {
 	// Open the file
 	file, err := os.Open(path)
 	if err != nil {
@@ -102,25 +103,62 @@ func (s *S3Client) UploadFile(ctx context.Context, path string) (string, error) 
 	}
 	defer file.Close()
 
-	// Get the filename as the object key
-	fileName := filepath.Base(path)
-
-	// Generate a unique object key to avoid conflicts
-	// Using timestamp as prefix
-	objectKey := fmt.Sprintf("%d/%s", time.Now().Unix(), fileName)
+	// Format the object key using the provided format
+	objectKey := filename
+	if len(objectKey) == 0 {
+		objectKey = uuid.New().String()
+	}
 
 	// Upload the file to S3
 	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(s.bucketName),
 		Key:         aws.String(objectKey),
 		Body:        file,
-		ContentType: aws.String(util.GetContentType(fileName)),
+		ContentType: aws.String(util.GetContentType(filename)),
 		// Remove public ACL as it's not supported by many S3 compatible services
 		// ACL:         types.ObjectCannedACLPublicRead,
 	})
 
 	if err != nil {
 		return "", fmt.Errorf("failed to upload file to S3: %w", err)
+	}
+
+	// Generate a presigned URL for the uploaded object
+	presignClient := s3.NewPresignClient(s.client)
+	presignedReq, err := presignClient.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucketName),
+		Key:    aws.String(objectKey),
+	}, func(opts *s3.PresignOptions) {
+		opts.Expires = s.expiration
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("failed to generate presigned URL: %w", err)
+	}
+
+	return presignedReq.URL, nil
+}
+
+// Upload uploads data from an io.Reader to S3 and returns the download URL
+func (s *S3Client) Upload(ctx context.Context, body io.Reader, filename string) (string, error) {
+	// Format the object key using the provided format
+	objectKey := filename
+	if len(objectKey) == 0 {
+		objectKey = uuid.New().String()
+	}
+
+	// Upload the data to S3
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(s.bucketName),
+		Key:         aws.String(objectKey),
+		Body:        body,
+		ContentType: aws.String(util.GetContentType(filename)),
+		// Remove public ACL as it's not supported by many S3 compatible services
+		// ACL:         types.ObjectCannedACLPublicRead,
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("failed to upload data to S3: %w", err)
 	}
 
 	// Generate a presigned URL for the uploaded object
